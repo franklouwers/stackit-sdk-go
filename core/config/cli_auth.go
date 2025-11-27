@@ -1,120 +1,59 @@
 package config
 
 import (
+	"context"
 	"fmt"
-	"net/http"
+
+	"github.com/stackitcloud/stackit-sdk-go/core/cliauth"
 )
 
-// CLIAuthProvider is an interface for external CLI authentication providers.
-// This interface allows the SDK to use CLI-stored credentials without creating
-// a circular dependency between the SDK and CLI packages.
-//
-// Implementations should provide access to credentials stored by authentication
-// tools like the STACKIT CLI's provider authentication (`stackit auth provider login`).
-//
-// Example implementation (in Terraform Provider or other CLI consumer):
-//
-//	import (
-//	    cliAuth "github.com/stackitcloud/stackit-cli/pkg/auth"
-//	    sdkConfig "github.com/stackitcloud/stackit-sdk-go/core/config"
-//	)
-//
-//	type CLIAuthAdapter struct{}
-//
-//	func (a *CLIAuthAdapter) IsAuthenticated() bool {
-//	    return cliAuth.IsProviderAuthenticated()
-//	}
-//
-//	func (a *CLIAuthAdapter) GetAuthFlow() (http.RoundTripper, error) {
-//	    return cliAuth.ProviderAuthFlow(nil)
-//	}
-//
-//	// Usage:
-//	client, err := dns.NewAPIClient(
-//	    sdkConfig.WithCLIProviderAuth(&CLIAuthAdapter{}),
-//	)
-type CLIAuthProvider interface {
-	// IsAuthenticated checks if CLI provider credentials are available.
-	// Returns true if credentials exist and can be used for authentication.
-	IsAuthenticated() bool
-
-	// GetAuthFlow returns an http.RoundTripper configured with CLI authentication.
-	// The RoundTripper handles token refresh and authentication headers automatically.
-	// Returns an error if credentials cannot be loaded or initialized.
-	GetAuthFlow() (http.RoundTripper, error)
-}
-
 // WithCLIProviderAuth returns a ConfigurationOption that configures authentication
-// using a CLI authentication provider.
+// using STACKIT CLI API credentials.
 //
-// This option enables the SDK to use credentials stored by external CLI tools
-// (like the STACKIT CLI) without creating a direct dependency on those tools.
-// Instead, the caller provides an implementation of CLIAuthProvider that bridges
-// between the SDK and the CLI.
+// This option enables the SDK to use credentials stored by the STACKIT CLI
+// (via 'stackit auth api login') directly, without requiring external adapters.
+//
+// Profile resolution order:
+//  1. Explicit profile parameter (if non-empty)
+//  2. STACKIT_CLI_PROFILE environment variable
+//  3. ~/.config/stackit/cli-profile.txt
+//  4. "default"
 //
 // The authentication flow:
-//   - Checks if CLI credentials are available via provider.IsAuthenticated()
-//   - Retrieves an authentication RoundTripper via provider.GetAuthFlow()
-//   - Configures the SDK client to use this RoundTripper
-//   - Tokens are automatically refreshed by the RoundTripper
-//   - Refreshed tokens are written back to CLI storage (bidirectional sync)
+//   - Reads credentials from system keyring or file fallback
+//   - Automatically refreshes expired tokens
+//   - Writes refreshed tokens back to storage (bidirectional sync)
 //
-// Returns an AuthenticationError if no CLI credentials are found or if
-// initialization fails.
+// Returns an AuthenticationError if no CLI credentials are found or cannot be initialized.
 //
-// Example usage in Terraform Provider:
+// Example usage:
 //
-//	import (
-//	    cliAuth "github.com/stackitcloud/stackit-cli/pkg/auth"
-//	    sdkConfig "github.com/stackitcloud/stackit-sdk-go/core/config"
+//	// Use default profile
+//	client, err := dns.NewAPIClient(
+//	    config.WithCLIProviderAuth(""),
 //	)
 //
-//	// Create adapter
-//	type adapter struct{}
-//	func (a *adapter) IsAuthenticated() bool {
-//	    return cliAuth.IsProviderAuthenticated()
-//	}
-//	func (a *adapter) GetAuthFlow() (http.RoundTripper, error) {
-//	    return cliAuth.ProviderAuthFlow(nil)
-//	}
-//
-//	// Check authentication
-//	adapter := &adapter{}
-//	if !adapter.IsAuthenticated() {
-//	    return fmt.Errorf("not authenticated: please run 'stackit auth provider login'")
-//	}
-//
-//	// Create API client with CLI auth
-//	client, err := dns.NewAPIClient(sdkConfig.WithCLIProviderAuth(adapter))
-//	if err != nil {
-//	    return fmt.Errorf("failed to create client: %w", err)
-//	}
-func WithCLIProviderAuth(provider CLIAuthProvider) ConfigurationOption {
+//	// Use custom profile
+//	client, err := dns.NewAPIClient(
+//	    config.WithCLIProviderAuth("production"),
+//	)
+func WithCLIProviderAuth(profile string) ConfigurationOption {
 	return func(c *Configuration) error {
-		if provider == nil {
-			return &AuthenticationError{
-				msg: "CLI auth provider cannot be nil",
-			}
-		}
-
-		// Check if CLI credentials are available
-		if !provider.IsAuthenticated() {
-			return &AuthenticationError{
-				msg: "not authenticated with CLI provider credentials: please run authentication command (e.g., 'stackit auth provider login')",
-			}
-		}
-
-		// Get the authentication RoundTripper from CLI
-		authFlow, err := provider.GetAuthFlow()
+		// Create CLI provider flow with optional background refresh context
+		flow, err := cliauth.NewCLIProviderFlowWithContext(
+			profile,
+			nil,
+			nil,
+			c.BackgroundTokenRefreshContext,
+		)
 		if err != nil {
-			return &AuthenticationError{
-				msg:   "failed to initialize CLI provider authentication",
-				cause: err,
-			}
+			// Return the error directly - it already has a good message
+			return err
 		}
 
 		// Configure the SDK to use CLI authentication
-		return WithCustomAuth(authFlow)(c)
+		c.CustomAuth = flow
+		return nil
 	}
 }
 
@@ -137,4 +76,39 @@ func (e *AuthenticationError) Error() string {
 // This allows errors.Is and errors.As to work with wrapped errors.
 func (e *AuthenticationError) Unwrap() error {
 	return e.cause
+}
+
+// WithCLIBackgroundTokenRefresh returns a ConfigurationOption that enables
+// background token refresh for CLI API authentication.
+//
+// When enabled, a goroutine will monitor CLI token expiration and automatically
+// refresh the token before it expires. The goroutine is terminated when the
+// provided context is canceled.
+//
+// This option only has effect when used together with WithCLIProviderAuth.
+// It must be applied BEFORE WithCLIProviderAuth in the configuration chain.
+//
+// Example usage:
+//
+//	ctx, cancel := context.WithCancel(context.Background())
+//	defer cancel()
+//
+//	client, err := dns.NewAPIClient(
+//	    config.WithCLIBackgroundTokenRefresh(ctx),
+//	    config.WithCLIProviderAuth(""),
+//	)
+//
+// Note: The background refresh goroutine will write status messages to stderr
+// when it terminates.
+func WithCLIBackgroundTokenRefresh(ctx context.Context) ConfigurationOption {
+	return func(c *Configuration) error {
+		if ctx == nil {
+			return fmt.Errorf("context for CLI background token refresh cannot be nil")
+		}
+
+		// Store context for CLI auth flow to use
+		// Note: This assumes CLIProviderAuth flow will check for this
+		c.BackgroundTokenRefreshContext = ctx
+		return nil
+	}
 }
